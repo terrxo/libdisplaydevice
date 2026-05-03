@@ -139,14 +139,19 @@ namespace display_device::evdi {
     void cb_cursor_set(struct evdi_cursor_set /*cs*/, void * /*ud*/) {}
     void cb_cursor_move(struct evdi_cursor_move /*cm*/, void * /*ud*/) {}
     void cb_ddcci(struct evdi_ddcci_data /*d*/, void * /*ud*/) {}
+    /// Maximum dirty-rect array size evdi may write back. evdi internally
+    /// supports up to ~16 dirty rects per frame; we give it 32 to be safe.
+    /// Passing a smaller array than evdi expects causes stack smashing.
+    constexpr int kMaxRects = 32;
+
     void cb_update_ready(int /*buffer_to_be_updated*/, void *user_data) {
 #if defined(LIBDD_HAVE_LIBEVDI)
       auto *cons = static_cast<VirtualDisplayConsumer *>(user_data);
       // Grab pixels into our backing buffer. We don't process the result;
       // this just satisfies evdi's "consumer must consume frames" contract.
-      struct evdi_rect rect = {0, 0, cons->width, cons->height};
-      int rect_count = 1;
-      evdi_grab_pixels(static_cast<evdi_handle>(cons->handle), &rect, &rect_count);
+      struct evdi_rect rects[kMaxRects];
+      int rect_count = kMaxRects;
+      evdi_grab_pixels(static_cast<evdi_handle>(cons->handle), rects, &rect_count);
 #endif
     }
 
@@ -191,9 +196,9 @@ namespace display_device::evdi {
         // immediate update without going through poll.
         bool immediate = evdi_request_update(h, cons->buffer_id);
         if (immediate) {
-          int rect_count = 1;
-          struct evdi_rect rect = {0, 0, cons->width, cons->height};
-          evdi_grab_pixels(h, &rect, &rect_count);
+          struct evdi_rect rects[kMaxRects];
+          int rect_count = kMaxRects;
+          evdi_grab_pixels(h, rects, &rect_count);
         }
         // Poll for events with a 100ms timeout (so we can periodically check stop flag).
         struct pollfd pfd {fd, POLLIN, 0};

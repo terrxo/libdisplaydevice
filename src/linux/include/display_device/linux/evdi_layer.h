@@ -46,11 +46,17 @@
 namespace display_device::evdi {
 
   /// Opaque handle wrapping libevdi's evdi_handle plus our bookkeeping.
+  /// We can't expose a std::thread directly because the destructor needs
+  /// to be trivially default-constructible for storage in std::map. The
+  /// consumer thread lives in a heap-allocated state struct managed by the
+  /// implementation.
+  struct VirtualDisplayConsumer;  // opaque, defined in evdi_layer.cpp
   struct VirtualDisplay {
     int m_card_index {-1};                ///< /dev/dri/cardN
     std::string m_drm_card_path;          ///< /sys/class/drm/cardN
     std::string m_connector_name;         ///< e.g. "DVI-I-1"
     void *m_handle {nullptr};             ///< actually evdi_handle (libevdi)
+    VirtualDisplayConsumer *m_consumer {nullptr};  ///< event loop running consumer
     VkmsVirtualDisplayConfig m_config {}; ///< what we asked for
   };
 

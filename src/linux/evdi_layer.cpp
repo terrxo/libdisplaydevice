@@ -21,16 +21,21 @@
 // system includes
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <mutex>
+#include <poll.h>
 #include <set>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 // local includes
 #include "display_device/logging.h"
@@ -42,6 +47,28 @@ extern "C" {
 #endif
 
 namespace display_device::evdi {
+
+  /**
+   * @brief Consumer state that runs in a background thread. Responsibilities:
+   *  - allocate a userspace buffer matching the virtual display resolution
+   *  - register it with libevdi (evdi_register_buffer)
+   *  - request frame updates and discard the pixels (we don't actually use them;
+   *    the COMPOSITOR's framebuffer is what kmsgrab captures)
+   *  - process compositor callbacks (mode changes, dpms, cursor moves)
+   *
+   * Without this consumer, evdi marks the connector as "no consumer present"
+   * and the compositor refuses to allocate frames for it.
+   */
+  struct VirtualDisplayConsumer {
+    void *handle {nullptr};       ///< evdi_handle
+    std::thread thread;
+    std::atomic<bool> stop {false};
+    int buffer_id {0};
+    std::vector<std::uint8_t> backing;
+    int stride {0};
+    int width {0};
+    int height {0};
+  };
 
   namespace {
     constexpr const char *kEvdiSysfsRoot = "/sys/devices/evdi";
@@ -101,6 +128,87 @@ namespace display_device::evdi {
         }
       }
       return {};
+    }
+
+    /// libevdi event callbacks for the consumer thread. We mostly ignore
+    /// what we receive; the goal is just to keep evdi happy so the
+    /// compositor sees a "live" output.
+    void cb_dpms(int /*mode*/, void * /*ud*/) {}
+    void cb_mode_changed(struct evdi_mode /*mode*/, void * /*ud*/) {}
+    void cb_crtc_state(int /*state*/, void * /*ud*/) {}
+    void cb_cursor_set(struct evdi_cursor_set /*cs*/, void * /*ud*/) {}
+    void cb_cursor_move(struct evdi_cursor_move /*cm*/, void * /*ud*/) {}
+    void cb_ddcci(struct evdi_ddcci_data /*d*/, void * /*ud*/) {}
+    void cb_update_ready(int /*buffer_to_be_updated*/, void *user_data) {
+#if defined(LIBDD_HAVE_LIBEVDI)
+      auto *cons = static_cast<VirtualDisplayConsumer *>(user_data);
+      // Grab pixels into our backing buffer. We don't process the result;
+      // this just satisfies evdi's "consumer must consume frames" contract.
+      struct evdi_rect rect = {0, 0, cons->width, cons->height};
+      int rect_count = 1;
+      evdi_grab_pixels(static_cast<evdi_handle>(cons->handle), &rect, &rect_count);
+#endif
+    }
+
+    /// Background thread that drives the evdi event loop for a single virtual display.
+    void consumerThread(VirtualDisplayConsumer *cons) {
+#if defined(LIBDD_HAVE_LIBEVDI)
+      auto h = static_cast<evdi_handle>(cons->handle);
+
+      // Allocate a backing buffer (stride = width*4 for ARGB32)
+      cons->stride = cons->width * 4;
+      cons->backing.assign(static_cast<size_t>(cons->stride) * cons->height, 0);
+
+      struct evdi_buffer buf {};
+      buf.id = 1;
+      buf.buffer = cons->backing.data();
+      buf.width = cons->width;
+      buf.height = cons->height;
+      buf.stride = cons->stride;
+      buf.rects = nullptr;
+      buf.rect_count = 0;
+      cons->buffer_id = buf.id;
+
+      evdi_register_buffer(h, buf);
+
+      // Set up event context
+      struct evdi_event_context ctx {};
+      ctx.dpms_handler = cb_dpms;
+      ctx.mode_changed_handler = cb_mode_changed;
+      ctx.update_ready_handler = cb_update_ready;
+      ctx.crtc_state_handler = cb_crtc_state;
+      ctx.cursor_set_handler = cb_cursor_set;
+      ctx.cursor_move_handler = cb_cursor_move;
+      ctx.ddcci_data_handler = cb_ddcci;
+      ctx.user_data = cons;
+
+      const evdi_selectable fd = evdi_get_event_ready(h);
+
+      DD_LOG(info) << "evdi consumer thread started for handle (fd=" << fd << ")";
+
+      while (!cons->stop.load(std::memory_order_relaxed)) {
+        // Ask evdi for a frame update; if it returns true we have an
+        // immediate update without going through poll.
+        bool immediate = evdi_request_update(h, cons->buffer_id);
+        if (immediate) {
+          int rect_count = 1;
+          struct evdi_rect rect = {0, 0, cons->width, cons->height};
+          evdi_grab_pixels(h, &rect, &rect_count);
+        }
+        // Poll for events with a 100ms timeout (so we can periodically check stop flag).
+        struct pollfd pfd {fd, POLLIN, 0};
+        int n = poll(&pfd, 1, 100);
+        if (n > 0 && (pfd.revents & POLLIN)) {
+          evdi_handle_events(h, &ctx);
+        }
+      }
+
+      // Cleanup: unregister buffer
+      evdi_unregister_buffer(h, cons->buffer_id);
+      DD_LOG(info) << "evdi consumer thread stopped";
+#else
+      (void) cons;
+#endif
     }
 
     /// Encode a 3-letter PnP manufacturer code into 2 EDID bytes (big-endian).
@@ -413,6 +521,18 @@ namespace display_device::evdi {
     vd.m_connector_name = connector;
     vd.m_handle = handle;
     vd.m_config = cfg;
+
+    // Spawn the consumer thread - this is what actually makes the compositor
+    // willing to use the virtual display. Without an evdi consumer that has
+    // registered a buffer, the kernel won't expose this output as drawable.
+    auto *cons = new VirtualDisplayConsumer();
+    cons->handle = handle;
+    cons->width = static_cast<int>(cfg.m_resolution.m_width);
+    cons->height = static_cast<int>(cfg.m_resolution.m_height);
+    cons->thread = std::thread(consumerThread, cons);
+    vd.m_consumer = cons;
+    DD_LOG(info) << "evdi: consumer thread launched for " << connector;
+
     return vd;
 #endif
   }
@@ -422,6 +542,16 @@ namespace display_device::evdi {
     (void) vd;
     return false;
 #else
+    // Stop the consumer thread first so it doesn't keep calling into
+    // libevdi while we close the handle.
+    if (vd.m_consumer) {
+      vd.m_consumer->stop.store(true, std::memory_order_relaxed);
+      if (vd.m_consumer->thread.joinable()) {
+        vd.m_consumer->thread.join();
+      }
+      delete vd.m_consumer;
+      vd.m_consumer = nullptr;
+    }
     if (vd.m_handle != nullptr) {
       auto h = static_cast<evdi_handle>(vd.m_handle);
       evdi_disconnect(h);

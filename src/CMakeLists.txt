@@ -9,9 +9,10 @@ elseif(APPLE)
     add_library(libdisplaydevice::platform ALIAS libdisplaydevice_macos_dummy)
     message(WARNING "MacOS is not supported yet.")
 elseif(UNIX)
-    add_library(libdisplaydevice_linux_dummy INTERFACE)
-    add_library(libdisplaydevice::platform ALIAS libdisplaydevice_linux_dummy)
-    message(WARNING "Linux is not supported yet.")
+    # Real Linux backend (vkms + wlr-output-management).
+    # Currently Phase 1 scaffold - returns safe defaults; replace with full
+    # implementation per LINUX_VDD_ROADMAP.md in Apollo repo root.
+    add_subdirectory(linux)
 else()
     message(FATAL_ERROR "Unsupported platform")
 endif()
